@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Multi-Grade Whiteboard Homework Auditor</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-100 min-h-screen text-slate-800 p-4 max-w-3xl mx-auto">
+
+  <header class="mb-6 text-center">
+    <h1 class="text-2xl font-bold text-slate-900">Whiteboard Homework Auditor</h1>
+    <p class="text-xs text-slate-500 mt-1">Audit all grades (9–12) from a single photo</p>
+  </header>
+
+  <!-- API Key Panel -->
+  <div class="bg-white p-4 rounded-xl shadow-sm mb-4 border border-slate-200">
+    <label for="apiKey" class="block text-xs font-semibold uppercase text-slate-500 mb-1">Gemini API Key</label>
+    <input type="password" id="apiKey" placeholder="Paste AI Studio Key here" autocomplete="off" class="w-full border border-slate-300 rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <p class="text-[10px] text-slate-400 mt-1">Saved only in this browser's local storage. It is never put in the page code.</p>
+  </div>
+
+  <!-- Capture Panel -->
+  <div class="bg-white p-4 rounded-xl shadow-sm mb-6 border border-slate-200 text-center space-y-4">
+    <div>
+      <input type="file" id="imageInput" accept="image/*" capture="environment" class="hidden">
+      <button onclick="document.getElementById('imageInput').click()" class="w-full bg-slate-800 text-white py-3 px-4 rounded-lg font-medium shadow hover:bg-slate-700 transition flex items-center justify-center gap-2">
+        📸 Snap Whiteboard Photo
+      </button>
+    </div>
+
+    <div id="previewContainer" class="hidden">
+      <img id="imagePreview" alt="Whiteboard preview" class="max-h-64 mx-auto rounded border border-slate-200">
+      <button id="analyzeBtn" onclick="runAudit()" class="w-full mt-3 bg-blue-600 text-white py-3 px-4 rounded-lg font-medium shadow hover:bg-blue-500 transition disabled:opacity-50 disabled:cursor-not-allowed">
+        🔍 Audit All Grades
+      </button>
+    </div>
+  </div>
+
+  <!-- Loader -->
+  <div id="loader" class="hidden text-center py-8">
+    <div class="inline-block animate-spin rounded-full h-8 w-8 border-4 border-blue-600 border-t-transparent"></div>
+    <p class="text-sm font-medium text-slate-600 mt-2">Reading entire board & matching against Grade 9–12 sheets...</p>
+  </div>
+
+  <!-- Audit Results Container -->
+  <div id="results" class="space-y-6 hidden"></div>
+
+  <script>
+    // ---------- CONFIG ----------
+    const SHEET_ID = "1ZsrtN1V0ImkeDpHIM7NN7xO1KRUIMSQPtvRd75IR_xk";
+    // If each grade is on its own tab, list the tab IDs (the "gid=" number in the
+    // sheet's URL) here, e.g. { "Grade 9": "0", "Grade 10": "123456" }.
+    // Leave empty to read only the first tab.
+    const SHEET_TABS = {};
+    // "gemini-flash-latest" always points at the newest Flash model.
+    // Swap in a fixed ID (e.g. "gemini-3.6-flash") if you want to pin a version.
+    const GEMINI_MODEL = "gemini-flash-latest";
+    const MAX_IMAGE_SIDE = 1600; // px; keeps uploads small and fast
+    // -----------------------------
+
+    const apiKeyInput = document.getElementById('apiKey');
+    const analyzeBtn = document.getElementById('analyzeBtn');
+    let currentBase64Image = null;
+
+    apiKeyInput.value = localStorage.getItem('gemini_key') || '';
+    apiKeyInput.addEventListener('input', () => {
+      localStorage.setItem('gemini_key', apiKeyInput.value.trim());
+    });
+
+    // Escape anything coming from the AI / sheet before putting it in innerHTML
+    function esc(v) {
+      return String(v ?? '').replace(/[&<>"']/g, c => (
+        { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+      ));
+    }
+
+    // Downscale + convert to JPEG so the mime type is always correct
+    function prepareImage(file) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          const scale = Math.min(1, MAX_IMAGE_SIDE / Math.max(img.width, img.height));
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(img.width * scale);
+          canvas.height = Math.round(img.height * scale);
+          canvas.getContext('2d').drawImage(img, 0, 0, canvas.width, canvas.height);
+          URL.revokeObjectURL(url);
+          resolve(canvas.toDataURL('image/jpeg', 0.85));
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(url);
+          reject(new Error("Could not read that image. Try taking the photo again."));
+        };
+        img.src = url;
+      });
+    }
+
+    document.getElementById('imageInput').addEventListener('change', async function (e) {
+      const file = e.target.files[0];
+      if (!file) return;
+      try {
+        const dataUrl = await prepareImage(file);
+        currentBase64Image = dataUrl.split(',')[1];
+        document.getElementById('imagePreview').src = dataUrl;
+        document.getElementById('previewContainer').classList.remove('hidden');
+        document.getElementById('results').classList.add('hidden');
+      } catch (err) {
+        alert(err.message);
+      }
+      e.target.value = ''; // lets you re-take/select the same photo
+    });
+
+    async function fetchSheetData() {
+      const base = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:csv`;
+      const tabs = Object.entries(SHEET_TABS);
+      const urls = tabs.length
+        ? tabs.map(([name, gid]) => [name, `${base}&gid=${gid}`])
+        : [["Sheet", base]];
+
+      const parts = [];
+      for (const [name, url] of urls) {
+        const res = await fetch(url);
+        if (!res.ok) {
+          throw new Error(`Could not fetch Google Sheet (${name}). Make sure sharing is set to "Anyone with the link can view".`);
+        }
+        parts.push(tabs.length ? `--- TAB: ${name} ---\n${await res.text()}` : await res.text());
+      }
+      return parts.join('\n\n');
+    }
+
+    function extractJson(text) {
+      const cleaned = text.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+      return JSON.parse(cleaned);
+    }
+
+    async function runAudit() {
+      const apiKey = apiKeyInput.value.trim();
+      if (!apiKey) {
+        alert("Please enter your Gemini API Key first.");
+        return;
+      }
+      if (!currentBase64Image) {
+        alert("Please take or choose a whiteboard photo first.");
+        return;
+      }
+
+      document.getElementById('loader').classList.remove('hidden');
+      document.getElementById('results').classList.add('hidden');
+      analyzeBtn.disabled = true;
+
+      try {
+        const csvText = await fetchSheetData();
+        const today = new Date().toLocaleDateString('en-US', {
+          weekday: 'long', year: 'numeric', month: 'long', day: 'numeric'
+        });
+
+        const promptText = `
+You are an expert whiteboard homework auditor.
+Today's date is ${today}.
+The attached image is a photo of a whiteboard with handwritten homework assignments for multiple grade levels (Grade 9, Grade 10, Grade 11, Grade 12).
+Below is the raw CSV data from the official school homework Google Sheet.
+
+RAW GOOGLE SHEET CSV DATA:
+${csvText}
+
+INSTRUCTIONS:
+1. Work out which assignments in the sheet are currently active for each grade (Grade 9, 10, 11, 12), ignoring anything already past its due date.
+2. Transcribe all handwritten assignments visible on the whiteboard and identify the grade level and subject each belongs to.
+3. Compare the whiteboard against the sheet for each grade:
+   - "missing": on the sheet but not on the whiteboard.
+   - "outdated": on the whiteboard but different from the sheet (wrong date, wrong page/number, removed assignment, etc.).
+   - "matched": on the whiteboard and consistent with the sheet.
+4. Include every grade, even if a grade has nothing on the board (then all of its active sheet items are "missing").
+5. Output ONLY a JSON object with this structure:
+
+{
+  "grades": [
+    {
+      "grade": "Grade 9",
+      "missing": [{"subject": "Subject Name", "description": "Assignment description", "dueDate": "Due Date"}],
+      "outdated": [{"whiteboardText": "Text on board", "sheetText": "Text on sheet", "reason": "Explanation"}],
+      "matched": [{"subject": "Subject Name", "description": "Assignment description"}]
+    }
+  ]
+}`;
+
+        const apiResponse = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-goog-api-key': apiKey
+            },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  { text: promptText },
+                  { inline_data: { mime_type: "image/jpeg", data: currentBase64Image } }
+                ]
+              }],
+              generationConfig: { response_mime_type: "application/json" }
+            })
+          }
+        );
+
+        const data = await apiResponse.json();
+
+        if (data.error) {
+          throw new Error(`Google API Error (${data.error.code}): ${data.error.message}`);
+        }
+
+        const parts = data.candidates?.[0]?.content?.parts;
+        if (!parts || !parts.length) {
+          throw new Error("No output returned from API. Make sure the photo is clear and try again.");
+        }
+
+        // Join text parts, skipping any "thought" parts some models return
+        const resultText = parts.filter(p => p.text && !p.thought).map(p => p.text).join('');
+        let parsedResults;
+        try {
+          parsedResults = extractJson(resultText);
+        } catch {
+          throw new Error("The AI returned an unreadable response. Please try again.");
+        }
+
+        displayMultiGradeResults(parsedResults);
+      } catch (err) {
+        alert("Audit Failed: " + err.message);
+      } finally {
+        document.getElementById('loader').classList.add('hidden');
+        analyzeBtn.disabled = false;
+      }
+    }
+
+    function displayMultiGradeResults(data) {
+      const container = document.getElementById('results');
+      container.innerHTML = '';
+
+      if (!data.grades || data.grades.length === 0) {
+        container.innerHTML = '<p class="text-center text-slate-500">No grade data found.</p>';
+        container.classList.remove('hidden');
+        return;
+      }
+
+      data.grades.forEach(g => {
+        const gradeCard = document.createElement('div');
+        gradeCard.className = 'bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden';
+
+        const missing = g.missing || [];
+        const outdated = g.outdated || [];
+        const matched = g.matched || [];
+
+        gradeCard.innerHTML = `
+          <div class="bg-slate-800 text-white px-4 py-3 font-bold text-sm sm:text-base flex justify-between items-center gap-2 flex-wrap">
+            <span>${esc(g.grade)}</span>
+            <span class="text-[11px] font-normal text-slate-300">
+              🔴 ${missing.length} missing | 🟡 ${outdated.length} outdated | 🟢 ${matched.length} matched
+            </span>
+          </div>
+          <div class="p-4 space-y-3">
+            <div class="bg-red-50 border border-red-200 rounded-lg p-3">
+              <h3 class="text-red-800 font-bold text-xs uppercase tracking-wide mb-1.5">🔴 Missing From Whiteboard</h3>
+              <ul class="space-y-1 text-xs text-red-900">
+                ${missing.length === 0 ? '<li class="italic text-slate-400">None</li>' : missing.map(i => `
+                  <li class="bg-white/70 p-1.5 rounded border border-red-100">
+                    <strong>${esc(i.subject)}:</strong> ${esc(i.description)}${i.dueDate ? ` <span class="text-slate-500">(Due: ${esc(i.dueDate)})</span>` : ''}
+                  </li>`).join('')}
+              </ul>
+            </div>
+
+            <div class="bg-amber-50 border border-amber-200 rounded-lg p-3">
+              <h3 class="text-amber-800 font-bold text-xs uppercase tracking-wide mb-1.5">🟡 Outdated / Mismatched</h3>
+              <ul class="space-y-1 text-xs text-amber-900">
+                ${outdated.length === 0 ? '<li class="italic text-slate-400">None</li>' : outdated.map(i => `
+                  <li class="bg-white/70 p-1.5 rounded border border-amber-100">
+                    <strong>Board:</strong> "${esc(i.whiteboardText)}"<br>
+                    <span>→ <strong>Sheet:</strong> ${esc(i.sheetText)} <em>(${esc(i.reason)})</em></span>
+                  </li>`).join('')}
+              </ul>
+            </div>
+
+            <div class="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+              <h3 class="text-emerald-800 font-bold text-xs uppercase tracking-wide mb-1.5">🟢 Up-To-Date Matches</h3>
+              <ul class="space-y-1 text-xs text-emerald-900">
+                ${matched.length === 0 ? '<li class="italic text-slate-400">None</li>' : matched.map(i => `
+                  <li class="bg-white/70 p-1.5 rounded border border-emerald-100">
+                    <strong>${esc(i.subject)}:</strong> ${esc(i.description)}
+                  </li>`).join('')}
+              </ul>
+            </div>
+          </div>
+        `;
+        container.appendChild(gradeCard);
+      });
+
+      container.classList.remove('hidden');
+    }
+  </script>
+</body>
+</html>

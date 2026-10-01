@@ -40,7 +40,7 @@
   <!-- Loader -->
   <div id="loader" class="hidden text-center py-8">
     <div class="inline-block animate-spin rounded-full h-8 w-8 border-4 border-blue-600 border-t-transparent"></div>
-    <p class="text-sm font-medium text-slate-600 mt-2">Reading entire board & matching against Grade 9–12 sheets...</p>
+    <p id="loaderText" class="text-sm font-medium text-slate-600 mt-2">Reading entire board & matching against Grade 9–12 sheets...</p>
   </div>
 
   <!-- Audit Results Container -->
@@ -55,7 +55,13 @@
     const SHEET_TABS = {};
     // "gemini-flash-latest" always points at the newest Flash model.
     // Swap in a fixed ID (e.g. "gemini-3.6-flash") if you want to pin a version.
-    const GEMINI_MODEL = "gemini-flash-latest";
+    // Models are tried in order. If the first is overloaded after all retries,
+    // the app automatically falls back to the next one.
+    const GEMINI_MODELS = ["gemini-flash-latest", "gemini-flash-lite-latest"];
+    // Wait times between retries on each model (so 3 attempts per model).
+    const RETRY_DELAYS_MS = [2000, 5000];
+    // HTTP codes that are temporary (overloaded / rate limited / server hiccup).
+    const RETRYABLE_CODES = [429, 500, 503, 504];
     const MAX_IMAGE_SIDE = 1600; // px; keeps uploads small and fast
     // -----------------------------
 
@@ -135,6 +141,58 @@
       return JSON.parse(cleaned);
     }
 
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const loaderText = document.getElementById('loaderText');
+    const DEFAULT_LOADER_TEXT = loaderText.textContent;
+
+    // Calls Gemini with automatic retries and model fallback
+    async function callGemini(apiKey, body) {
+      let lastError;
+      for (let m = 0; m < GEMINI_MODELS.length; m++) {
+        const model = GEMINI_MODELS[m];
+        for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+          try {
+            const res = await fetch(
+              `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+                body: JSON.stringify(body)
+              }
+            );
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && !data.error) return data;
+
+            const code = data.error?.code || res.status;
+            const err = new Error(`Google API Error (${code}): ${data.error?.message || res.statusText}`);
+            err.status = code;
+            throw err;
+          } catch (e) {
+            lastError = e;
+            const isNetworkError = e instanceof TypeError;
+            const retryable = isNetworkError || RETRYABLE_CODES.includes(e.status);
+
+            // Model not found: skip straight to the next model if there is one
+            if (e.status === 404 && m < GEMINI_MODELS.length - 1) break;
+            // Bad key, denied project, bad request, etc.: retrying won't help
+            if (!retryable) throw e;
+
+            if (attempt < RETRY_DELAYS_MS.length) {
+              const secs = Math.round(RETRY_DELAYS_MS[attempt] / 1000);
+              loaderText.textContent = `Google is busy. Retrying in ${secs}s (attempt ${attempt + 2} of ${RETRY_DELAYS_MS.length + 1})...`;
+              await sleep(RETRY_DELAYS_MS[attempt]);
+              loaderText.textContent = DEFAULT_LOADER_TEXT;
+            } else if (m < GEMINI_MODELS.length - 1) {
+              loaderText.textContent = 'Main model is busy. Switching to backup model...';
+              await sleep(1000);
+              loaderText.textContent = DEFAULT_LOADER_TEXT;
+            }
+          }
+        }
+      }
+      throw new Error(`${lastError.message}\n\nGoogle is still busy after several tries. Please wait a minute and try again.`);
+    }
+
     async function runAudit() {
       const apiKey = apiKeyInput.value.trim();
       if (!apiKey) {
@@ -186,31 +244,15 @@ INSTRUCTIONS:
   ]
 }`;
 
-        const apiResponse = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'x-goog-api-key': apiKey
-            },
-            body: JSON.stringify({
-              contents: [{
-                parts: [
-                  { text: promptText },
-                  { inline_data: { mime_type: "image/jpeg", data: currentBase64Image } }
-                ]
-              }],
-              generationConfig: { response_mime_type: "application/json" }
-            })
-          }
-        );
-
-        const data = await apiResponse.json();
-
-        if (data.error) {
-          throw new Error(`Google API Error (${data.error.code}): ${data.error.message}`);
-        }
+        const data = await callGemini(apiKey, {
+          contents: [{
+            parts: [
+              { text: promptText },
+              { inline_data: { mime_type: "image/jpeg", data: currentBase64Image } }
+            ]
+          }],
+          generationConfig: { response_mime_type: "application/json" }
+        });
 
         const parts = data.candidates?.[0]?.content?.parts;
         if (!parts || !parts.length) {
@@ -231,6 +273,7 @@ INSTRUCTIONS:
         alert("Audit Failed: " + err.message);
       } finally {
         document.getElementById('loader').classList.add('hidden');
+        loaderText.textContent = DEFAULT_LOADER_TEXT;
         analyzeBtn.disabled = false;
       }
     }
